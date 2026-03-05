@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Data utilities
+# -----------------------------
+def load_csv_prices(path: str, date_col: str = "Date", price_col: str = "Close") -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df[date_col] = pd.to_datetime(df[date_col], utc=False)
+    df = df.sort_values(date_col).set_index(date_col)
+    df = df[[price_col]].rename(columns={price_col: "Close"}).dropna()
+    return df
+
+
+# -----------------------------
+# Backtest config + engine
+# -----------------------------
+@dataclass(frozen=True)
+class BacktestConfig:
+    fast_span: int = 12
+    slow_span: int = 26
+
+    initial_capital: float = 10_000.0
+    bars_per_year: int = 252
+
+    # Sizing
+    sizing: str = "fixed_fraction"  # "fixed_fraction" or "vol_target"
+    fraction: float = 1.0           # used if fixed_fraction
+    vol_lookback: int = 20          # used if vol_target
+    target_annual_vol: float = 0.20 # used if vol_target
+    max_leverage: float = 2.0
+
+    # Costs (all in basis points, applied per 1.0 turnover)
+    commission_bps: float = 1.0
+    slippage_bps: float = 1.0
+    half_spread_bps: float = 0.0    # optional extra realism: bid/ask half-spread
+
+    # Risk-free (optional; for Sharpe)
+    annual_rf: float = 0.0
+
+
+@dataclass
+class BacktestResult:
+    frame: pd.DataFrame
+    trades: pd.DataFrame
+    stats: pd.Series
+
+
+def _validate_inputs(close: pd.Series, cfg: BacktestConfig) -> pd.Series:
+    close = pd.Series(close).dropna()
+    if close.size < max(cfg.fast_span, cfg.slow_span) + 5:
+        raise ValueError("Not enough price history for the chosen EMA spans.")
+    if cfg.fast_span >= cfg.slow_span:
+        raise ValueError("fast_span should be < slow_span for a standard crossover.")
+    if cfg.bars_per_year <= 0:
+        raise ValueError("bars_per_year must be positive.")
+    return close
+
+
+def compute_indicators(close: pd.Series, cfg: BacktestConfig) -> pd.DataFrame:
+    df = pd.DataFrame({"Close": close})
+    df["EMA_fast"] = df["Close"].ewm(span=cfg.fast_span, adjust=False).mean()
+    df["EMA_slow"] = df["Close"].ewm(span=cfg.slow_span, adjust=False).mean()
+    return df
+
+
+def generate_signals(df: pd.DataFrame) -> pd.Series:
+    """
+    Signal is computed on bar t using Close(t).
+    We will apply positions on bar t+1 to avoid lookahead.
+    """
+    return (df["EMA_fast"] > df["EMA_slow"]).astype(int)  # 1=long desire, 0=flat desire
+
+
+def compute_exposure(df: pd.DataFrame, cfg: BacktestConfig) -> pd.Series:
+    if cfg.sizing == "fixed_fraction":
+        expo = float(cfg.fraction)
+        return pd.Series(expo, index=df.index).clip(lower=0.0, upper=cfg.max_leverage)
+
+    if cfg.sizing == "vol_target":
+        # Using close-to-close returns as a proxy for volatility (daily bars).
+        asset_ret = df["Close"].pct_change()
+        daily_vol = asset_ret.rolling(cfg.vol_lookback).std(ddof=0)
+        ann_vol = daily_vol * np.sqrt(cfg.bars_per_year)
+
+        raw = cfg.target_annual_vol / ann_vol
+        expo = raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return expo.clip(lower=0.0, upper=cfg.max_leverage)
+
+    raise ValueError("cfg.sizing must be 'fixed_fraction' or 'vol_target'")
+
+
+def simulate_portfolio(df: pd.DataFrame, signal: pd.Series, exposure: pd.Series, cfg: BacktestConfig) -> pd.DataFrame:
+    out = df.copy()
+
+    # Desired position is 0/1; apply on next bar to avoid lookahead.
+    desired = signal.astype(float)
+    position = desired.shift(1).fillna(0.0) * exposure
+
+    out["Signal"] = desired
+    out["Exposure"] = exposure
+    out["Position"] = position
+
+    # Returns
+    out["AssetRet"] = out["Close"].pct_change().fillna(0.0)
+
+    # Turnover (abs change in position). Costs applied proportional to turnover.
+    out["Turnover"] = out["Position"].diff().abs().fillna(0.0)
+
+    # Cost model: commission + slippage + (optional) half-spread, all in bps.
+    cost_rate = (cfg.commission_bps + cfg.slippage_bps + cfg.half_spread_bps) / 10_000.0
+    out["Cost"] = out["Turnover"] * cost_rate
+
+    # Strategy returns (long/flat)
+    out["StratRet"] = out["Position"] * out["AssetRet"] - out["Cost"]
+
+    # Equity curve
+    out["Equity"] = cfg.initial_capital * (1.0 + out["StratRet"]).cumprod()
+    out["EquityPeak"] = out["Equity"].cummax()
+    out["Drawdown"] = out["Equity"] / out["EquityPeak"] - 1.0
+
+    return out
+
+
+# -----------------------------
+# Trade extraction (blotter)
+# -----------------------------
+def extract_trades(bt: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trades are defined by changes in the *applied* Position series (already shifted).
+    Entry when Position goes 0 -> >0, Exit when >0 -> 0.
+    Uses close prices for entry/exit (end-of-bar proxy).
+    """
+    pos = bt["Position"].fillna(0.0)
+    chg = pos.diff().fillna(0.0)
+
+    entry_idx = bt.index[chg > 0]
+    exit_idx  = bt.index[chg < 0]
+
+    # If still in a trade at the end, close it on the final bar.
+    if len(entry_idx) > len(exit_idx):
+        exit_idx = exit_idx.append(pd.Index([bt.index[-1]]))
+
+    trades: List[Dict] = []
+    for e, x in zip(entry_idx, exit_idx):
+        if x <= e:
+            continue
+        entry_price = float(bt.at[e, "Close"])
+        exit_price  = float(bt.at[x, "Close"])
+
+        eq_entry = float(bt.at[e, "Equity"])
+        eq_exit  = float(bt.at[x, "Equity"])
+
+        trades.append({
+            "EntryTime": e,
+            "ExitTime": x,
+            "EntryPrice": entry_price,
+            "ExitPrice": exit_price,
+            "HoldBars": int(bt.index.get_loc(x) - bt.index.get_loc(e)),
+            "GrossReturn": (exit_price / entry_price) - 1.0,
+            "NetReturn": (eq_exit / eq_entry) - 1.0,
+        })
+
+    return pd.DataFrame(trades)
+
+
+# -----------------------------
+# Analytics
+# -----------------------------
+def performance_stats(bt: pd.DataFrame, trades: pd.DataFrame, cfg: BacktestConfig) -> pd.Series:
+    r = bt["StratRet"].astype(float)
+    eq = bt["Equity"].astype(float)
+
+    # Annualisation
+    n = len(r)
+    years = n / cfg.bars_per_year
+
+    total_return = (eq.iloc[-1] / eq.iloc[0]) - 1.0
+    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1.0 / years) - 1.0 if years > 0 else np.nan
+
+    ann_ret = r.mean() * cfg.bars_per_year
+    ann_vol = r.std(ddof=0) * np.sqrt(cfg.bars_per_year)
+
+    # Excess return Sharpe
+    rf_daily = (1.0 + cfg.annual_rf) ** (1.0 / cfg.bars_per_year) - 1.0
+    excess = r - rf_daily
+    sharpe = (excess.mean() * cfg.bars_per_year) / ann_vol if ann_vol > 0 else np.nan
+
+    # Sortino (downside deviation)
+    downside = r.copy()
+    downside[downside > 0] = 0.0
+    downside_vol = downside.std(ddof=0) * np.sqrt(cfg.bars_per_year)
+    sortino = (excess.mean() * cfg.bars_per_year) / downside_vol if downside_vol > 0 else np.nan
+
+    max_dd = float(bt["Drawdown"].min())
+    calmar = cagr / abs(max_dd) if max_dd < 0 else np.nan
+
+    # Distribution diagnostics
+    skew = r.skew()
+    kurt = r.kurtosis()
+
+    # Historical VaR / CVaR
+    var_95 = float(np.quantile(r, 0.05))
+    cvar_95 = float(r[r <= var_95].mean()) if (r <= var_95).any() else np.nan
+
+    # Operational metrics
+    avg_exposure = float(bt["Position"].mean())
+    avg_turnover = float(bt["Turnover"].mean())
+    total_turnover = float(bt["Turnover"].sum())
+
+    # Trade metrics
+    trade_count = int(len(trades))
+    trade_win_rate = float((trades["NetReturn"] > 0).mean()) if trade_count > 0 else np.nan
+
+    if trade_count > 0:
+        wins = trades.loc[trades["NetReturn"] > 0, "NetReturn"]
+        losses = trades.loc[trades["NetReturn"] <= 0, "NetReturn"]
+        avg_win = float(wins.mean()) if len(wins) else np.nan
+        avg_loss = float(losses.mean()) if len(losses) else np.nan
+        profit_factor = float(wins.sum() / abs(losses.sum())) if len(losses) and abs(losses.sum()) > 0 else np.nan
+        expectancy = float(trades["NetReturn"].mean())
+        avg_hold = float(trades["HoldBars"].mean())
+    else:
+        avg_win = avg_loss = profit_factor = expectancy = avg_hold = np.nan
+
+    return pd.Series({
+        "Total Return": total_return,
+        "CAGR": cagr,
+        "Annualized Return": ann_ret,
+        "Annualized Volatility": ann_vol,
+        "Sharpe (excess)": sharpe,
+        "Sortino": sortino,
+        "Max Drawdown": max_dd,
+        "Calmar": calmar,
+        "VaR 95% (daily)": var_95,
+        "CVaR 95% (daily)": cvar_95,
+        "Skew (daily)": skew,
+        "Kurtosis (daily)": kurt,
+        "Avg Exposure": avg_exposure,
+        "Avg Turnover": avg_turnover,
+        "Total Turnover": total_turnover,
+        "Number of Trades": trade_count,
+        "Trade Win Rate": trade_win_rate,
+        "Avg Win (net)": avg_win,
+        "Avg Loss (net)": avg_loss,
+        "Profit Factor": profit_factor,
+        "Expectancy (net)": expectancy,
+        "Avg Hold (bars)": avg_hold,
+    })
+
+
+def ema_crossover_backtest(close: pd.Series, cfg: BacktestConfig) -> BacktestResult:
+    close = _validate_inputs(close, cfg)
+    df = compute_indicators(close, cfg)
+    sig = generate_signals(df)
+    expo = compute_exposure(df, cfg)
+    bt = simulate_portfolio(df, sig, expo, cfg)
+    trades = extract_trades(bt)
+    stats = performance_stats(bt, trades, cfg)
+    return BacktestResult(frame=bt, trades=trades, stats=stats)
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_backtest(result: BacktestResult, title: str = "EMA Crossover Backtest") -> None:
+    bt = result.frame
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    # Price + EMAs
+    ax1.plot(bt.index, bt["Close"], label="Close")
+    ax1.plot(bt.index, bt["EMA_fast"], label="EMA_fast")
+    ax1.plot(bt.index, bt["EMA_slow"], label="EMA_slow")
+
+    # Mark entries/exits based on applied Position changes
+    pos = bt["Position"].fillna(0.0)
+    chg = pos.diff().fillna(0.0)
+    entries = bt.index[chg > 0]
+    exits = bt.index[chg < 0]
+    ax1.scatter(entries, bt.loc[entries, "Close"], marker="^", label="Entry")
+    ax1.scatter(exits, bt.loc[exits, "Close"], marker="v", label="Exit")
+
+    ax1.set_title(title)
+    ax1.set_ylabel("Price")
+    ax1.legend(loc="best")
+
+    # Equity
+    ax2.plot(bt.index, bt["Equity"], label="Equity")
+    ax2.set_ylabel("Equity")
+    ax2.legend(loc="best")
+
+    # Drawdown
+    ax3.plot(bt.index, bt["Drawdown"], label="Drawdown")
+    ax3.set_ylabel("Drawdown")
+    ax3.set_xlabel("Date")
+    ax3.legend(loc="best")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# -----------------------------
+# Optional: parameter grid search
+# -----------------------------
+def grid_search_ema(
+    close: pd.Series,
+    fast_list: List[int],
+    slow_list: List[int],
+    base_cfg: Optional[BacktestConfig] = None,
+    objective: str = "Sharpe (excess)",
+) -> Tuple[pd.DataFrame, BacktestConfig]:
+    """
+    Simple brute-force grid search over EMA spans.
+    Returns a table of metrics and the best config by chosen objective.
+    """
+    base_cfg = base_cfg or BacktestConfig()
+    rows = []
+
+    for f in fast_list:
+        for s in slow_list:
+            if f >= s:
+                continue
+            cfg = BacktestConfig(**{**base_cfg.__dict__, "fast_span": f, "slow_span": s})
+            res = ema_crossover_backtest(close, cfg)
+            row = {"fast_span": f, "slow_span": s, **res.stats.to_dict()}
+            rows.append(row)
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        raise ValueError("Grid search produced no valid (fast, slow) pairs.")
+
+    table = table.sort_values(objective, ascending=False, na_position="last").reset_index(drop=True)
+    best = table.iloc[0]
+    best_cfg = BacktestConfig(**{**base_cfg.__dict__, "fast_span": int(best["fast_span"]), "slow_span": int(best["slow_span"])})
+    return table, best_cfg
+
+
+# -----------------------------
+# Example usage (CSV)
+# -----------------------------
+if __name__ == "__main__":
+    # df = load_csv_prices("prices.csv", date_col="Date", price_col="Close")
+    # close = df["Close"]
+
+    # cfg = BacktestConfig(
+    #     fast_span=12,
+    #     slow_span=26,
+    #     sizing="vol_target",
+    #     target_annual_vol=0.20,
+    #     vol_lookback=20,
+    #     max_leverage=2.0,
+    #     commission_bps=1.0,
+    #     slippage_bps=1.0,
+    #     half_spread_bps=0.5,
+    # )
+
+    # res = ema_crossover_backtest(close, cfg)
+    # print(res.stats.to_string(float_format=lambda x: f"{x:0.4f}"))
+    # print("\nTrade blotter (head):\n", res.trades.head())
+    # plot_backtest(res, title=f"EMA({cfg.fast_span},{cfg.slow_span}) Crossover")
+
+    pass
